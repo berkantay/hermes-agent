@@ -6,6 +6,7 @@ Supported:
 
 - [Bitwarden Secrets Manager](./bitwarden) — `bws` CLI, lazy-installed, free tier works.
 - [1Password](./onepassword) — `op://` references via the official `op` CLI; service-account or desktop session auth.
+- [Command helper](./command) — any CLI vault (`keepassxc-cli`, `secret-tool`, `pass`, custom scripts) via a user-configured helper that prints `KEY=VALUE` lines.
 
 ## Multiple sources at once
 
@@ -29,7 +30,7 @@ Every credential injected by a source is labelled with its origin — setup flow
 
 ## Profiles and shared vaults
 
-Two orchestrator-level knobs make one shared vault safe across [profiles](../features/profiles):
+Two orchestrator-level knobs make one shared vault safe across [profiles](../profiles):
 
 - **`secrets.preserve_existing`** — a list of env var names whose existing `.env` / shell value always wins, even against a source with `override_existing: true`. Use it for per-profile platform secrets (e.g. `FEISHU_APP_SECRET`) that intentionally differ across profiles while everything else rotates centrally:
 

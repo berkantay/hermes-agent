@@ -26,7 +26,6 @@ from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_swarm as ks
-from hermes_cli.profiles import get_active_profile_name
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +76,8 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "result": t.result,
         "skills": list(t.skills) if t.skills else [],
         "max_retries": t.max_retries,
+        "model_override": t.model_override,
+        "provider_override": t.provider_override,
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
@@ -132,7 +133,9 @@ def _parse_branch_flag(value: Optional[str]) -> Optional[str]:
     return branch
 
 
-def _check_dispatcher_presence() -> tuple[bool, str]:
+def _check_dispatcher_presence(
+    hermes_home: Optional[Path] = None,
+) -> tuple[bool, str]:
     """Return ``(running, message)``.
 
     - ``running=True``: a gateway is alive for this HERMES_HOME and its
@@ -147,15 +150,35 @@ def _check_dispatcher_presence() -> tuple[bool, str]:
     Defensive against import failures and config-read errors — if the
     probe itself errors, we return ``(True, "")`` so we don't spam
     false warnings (better to miss a warning than to cry wolf).
+
+    ``hermes_home`` scopes the probe to a named profile's directory. The
+    dashboard plugin API passes it because the dashboard backend process can
+    be running under a different HERMES_HOME than the profile the request
+    targets, which otherwise produced a "no gateway is running" warning
+    against a perfectly healthy profile gateway (#71211). CLI callers leave
+    it ``None`` and keep the existing process-level behavior.
     """
     try:
-        from gateway.status import get_running_pid  # type: ignore
+        from gateway.status import resolve_gateway_liveness  # type: ignore
     except Exception:
         return (True, "")  # can't probe — silent
     try:
-        pid = get_running_pid()
+        # Same shared ladder the dashboard status endpoints use, so a
+        # PID-file-less (launch-service-managed) or cross-container gateway
+        # is not misreported as absent. use_cache=False: this is a one-shot
+        # CLI/create-time probe, not a polling loop, and it must observe the
+        # gateway's state right now rather than a cached snapshot.
+        liveness = resolve_gateway_liveness(
+            profile_dir=hermes_home, use_cache=False
+        )
     except Exception:
         return (True, "")  # probe errored — silent
+    if liveness.probe_error:
+        # The resolver swallows per-rung failures so status endpoints never
+        # 500. This caller must still fail OPEN: an unreadable probe means
+        # "can't tell", not "no gateway", and warning on it cries wolf.
+        return (True, "")
+    pid = liveness.pid
 
     # Even if the gateway is up, dispatch_in_gateway may be off.
     try:
@@ -347,6 +370,16 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "two retries. Omit to use the dispatcher's "
                                "kanban.failure_limit config "
                                f"(default {kb.DEFAULT_FAILURE_LIMIT}).")
+    p_create.add_argument("--model", default=None, dest="model_override",
+                          help="Pin the worker to this model (passed as "
+                               "-m <model>) without changing the profile's "
+                               "configured model. Combine with --provider "
+                               "when the model belongs to a different "
+                               "backend than the profile's default.")
+    p_create.add_argument("--provider", default=None, dest="provider_override",
+                          help="Provider the --model belongs to (passed as "
+                               "--provider <name> to the worker). Requires "
+                               "--model.")
     p_create.add_argument("--goal", action="store_true", dest="goal_mode",
                           help="Run the worker in a goal loop: after each "
                                "turn a judge checks the response against the "
@@ -444,6 +477,23 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_assign = sub.add_parser("assign", help="Assign or reassign a task")
     p_assign.add_argument("task_id")
     p_assign.add_argument("profile", help="Profile name (or 'none' to unassign)")
+
+    # --- set-model (per-task model/provider override) ---
+    p_set_model = sub.add_parser(
+        "set-model",
+        help="Set or clear a task's model/provider override "
+             "(takes effect on the next dispatch)",
+    )
+    p_set_model.add_argument("task_id")
+    p_set_model.add_argument(
+        "model", nargs="?", default=None,
+        help="Model to pin the worker to (or 'none' to clear the override)",
+    )
+    p_set_model.add_argument(
+        "--provider", default=None,
+        help="Provider the model belongs to (worker is spawned with "
+             "--provider <name>). Cleared together with the model.",
+    )
 
     # --- reclaim / reassign (recovery) ---
     p_reclaim = sub.add_parser(
@@ -605,6 +655,50 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_unblock.add_argument("task_ids", nargs="+")
 
+    p_request_review = sub.add_parser(
+        "request-review",
+        help="Move a task to 'review' (implementation done, awaiting review) — NOT a block",
+    )
+    p_request_review.add_argument("task_id")
+    p_request_review.add_argument(
+        "--summary", default=None,
+        help="What was implemented and how it was verified — shown to the reviewer.",
+    )
+    p_request_review.add_argument(
+        "--reviewer", default=None,
+        help="Optional reviewer profile; reassigns the task before review dispatch.",
+    )
+    p_request_review.add_argument(
+        "--metadata", default=None,
+        help="JSON object with structured reviewer handoff facts.",
+    )
+    p_request_review.add_argument(
+        "--force", action="store_true",
+        help=(
+            "Override the live-claim guard: move a running, claimed task to "
+            "review even without owning its run (clears the worker's claim)."
+        ),
+    )
+
+    p_request_changes = sub.add_parser(
+        "request-changes",
+        help="Reviewer verdict: return the active review run to its implementer",
+    )
+    p_request_changes.add_argument("task_id")
+    p_request_changes.add_argument(
+        "reason", nargs="+", help="Concrete changes required before re-review",
+    )
+
+    p_reopen_review = sub.add_parser(
+        "reopen-review",
+        help="Send one or more review tasks back for changes (review -> ready/todo)",
+    )
+    p_reopen_review.add_argument("task_ids", nargs="+")
+    p_reopen_review.add_argument(
+        "--reason", default=None,
+        help="Optional reason/note — recorded as a comment before reopening. Quote multi-word reasons.",
+    )
+
     p_promote = sub.add_parser(
         "promote",
         help="Manually move one or more todo/blocked tasks to ready (recovery path)",
@@ -722,9 +816,30 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_nsub.add_argument("--chat-id", required=True)
     p_nsub.add_argument("--thread-id", default=None)
     p_nsub.add_argument("--user-id", default=None)
+    p_nsub.add_argument("--user-id-alt", default=None)
+    p_nsub.add_argument(
+        "--chat-type",
+        choices=("dm", "group", "channel", "thread"),
+        default=None,
+        help="Originating source chat_type, recorded so the active-wake "
+             "delivery modes resolve the operator's real session. Omit to "
+             "leave an existing sub unchanged (new subs default to 'dm').",
+    )
     p_nsub.add_argument(
         "--notifier-profile", default=None,
         help="Profile gateway that owns/delivers this subscription (default: active profile)",
+    )
+    p_nsub.add_argument(
+        "--delivery-mode",
+        # Single source of truth shared with the DB/watcher enum.
+        choices=kb._NOTIFY_DELIVERY_MODES,
+        default=None,
+        help="How the kanban-notifier reacts to terminal events for this "
+             "subscription: 'notify' (passive message only; default), "
+             "'notify+wake' (message AND wake the destination gateway agent so "
+             "it reads the full board context and replies in its own voice), or "
+             "'wake' (wake the agent only, no passive message). Omit to leave an "
+             "existing subscription's mode unchanged (new subs default to 'notify').",
     )
 
     p_nlist = sub.add_parser(
@@ -926,6 +1041,15 @@ def kanban_command(args: argparse.Namespace) -> int:
             )
         return 0
 
+    # Fast-fail for clearer CLI UX only. The durable trust boundary is lower in
+    # hermes_cli.kanban_db, because children can import DB mutators directly.
+    if _is_delegated_child_cli_mutation(args):
+        print(
+            "kanban: delegate_task child contexts cannot mutate Kanban tasks via the CLI",
+            file=sys.stderr,
+        )
+        return 1
+
     # Board-management commands operate on board metadata and the persisted
     # current-board pointer itself. They must ignore the shared `--board`
     # task-routing override; otherwise `/kanban --board beta boards show`
@@ -989,6 +1113,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "ls":       _cmd_list,
             "show":     _cmd_show,
             "assign":   _cmd_assign,
+            "set-model": _cmd_set_model,
             "reclaim":  _cmd_reclaim,
             "reassign": _cmd_reassign,
             "diagnostics": _cmd_diagnostics,
@@ -1005,6 +1130,9 @@ def kanban_command(args: argparse.Namespace) -> int:
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
             "unblock":  _cmd_unblock,
+            "request-review": _cmd_request_review,
+            "request-changes": _cmd_request_changes,
+            "reopen-review":  _cmd_reopen_review,
             "promote":  _cmd_promote,
             "archive":  _cmd_archive,
             "tail":     _cmd_tail,
@@ -1050,6 +1178,66 @@ def _profile_author() -> str:
         return get_active_profile_name() or "user"
     except Exception:
         return "user"
+
+
+_DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
+    "init",
+    "create",
+    "swarm",
+    "assign",
+    "reclaim",
+    "reassign",
+    "link",
+    "unlink",
+    "claim",
+    "comment",
+    "attach",
+    "attach-rm",
+    "complete",
+    "edit",
+    "block",
+    "schedule",
+    "unblock",
+    "promote",
+    "archive",
+    "dispatch",
+    "daemon",
+    "repair",
+    "heartbeat",
+    "notify-subscribe",
+    "notify-unsubscribe",
+    "specify",
+    "decompose",
+    "gc",
+})
+
+_DELEGATED_CHILD_DENIED_BOARD_ACTIONS: frozenset[str] = frozenset({
+    "create",
+    "new",
+    "rm",
+    "remove",
+    "delete",
+    "switch",
+    "use",
+    "rename",
+    "set-default-workdir",
+})
+
+
+def _is_delegated_child_cli_mutation(args: argparse.Namespace) -> bool:
+    action = getattr(args, "kanban_action", None)
+    if action == "boards":
+        boards_action = getattr(args, "boards_action", None) or "list"
+        if boards_action not in _DELEGATED_CHILD_DENIED_BOARD_ACTIONS:
+            return False
+    elif action not in _DELEGATED_CHILD_DENIED_ACTIONS:
+        return False
+    try:
+        from agent.delegation_context import is_delegated_child_process_context
+
+        return is_delegated_child_process_context()
+    except Exception:
+        return bool(os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT"))
 
 
 # ---------------------------------------------------------------------------
@@ -1393,6 +1581,8 @@ def _cmd_create(args: argparse.Namespace) -> int:
             max_runtime_seconds=max_runtime,
             skills=getattr(args, "skills", None) or None,
             max_retries=max_retries,
+            model_override=getattr(args, "model_override", None),
+            provider_override=getattr(args, "provider_override", None),
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
@@ -1501,6 +1691,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    graph = None
     with kb.connect_closing() as conn:
         task = kb.get_task(conn, args.task_id)
         if not task:
@@ -1515,6 +1706,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
         # ``result=``. Surfacing the latest summary here keeps ``show`` from
         # looking like a no-op when the worker actually did real work.
         latest_summary = kb.latest_summary(conn, args.task_id)
+        if not getattr(args, "json", False):
+            graph = kb.task_graph_context(conn, task.id)
 
     if getattr(args, "json", False):
         payload = {
@@ -1567,7 +1760,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
     if task.skills:
         print(f"  skills:    {', '.join(task.skills)}")
     if task.model_override:
-        print(f"  model:     {task.model_override}")
+        _prov = f" (provider: {task.provider_override})" if task.provider_override else ""
+        print(f"  model:     {task.model_override}{_prov}")
     # Effective retry threshold. Show the per-task override if set,
     # otherwise the dispatcher's resolved value from config (or the
     # default if config doesn't set it either). Helps operators see
@@ -1591,7 +1785,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
     # of show output so CLI users see them before scrolling through
     # comments / runs.
     from hermes_cli import kanban_diagnostics as kd
-    diags = kd.compute_task_diagnostics(task, events, runs)
+    diags = kd.compute_task_diagnostics(task, events, runs, graph=graph)
     if diags:
         sev_marker = {"warning": "⚠", "error": "!!", "critical": "!!!"}
         print(f"\n  Diagnostics ({len(diags)}):")
@@ -1675,6 +1869,30 @@ def _cmd_assign(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_set_model(args: argparse.Namespace) -> int:
+    model = args.model
+    if model is not None and model.lower() in {"none", "-", "null", ""}:
+        model = None
+    provider = getattr(args, "provider", None)
+    try:
+        with kb.connect_closing() as conn:
+            ok = kb.set_model_override(conn, args.task_id, model, provider=provider)
+    except (ValueError, RuntimeError) as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 2
+    if not ok:
+        print(f"no such task: {args.task_id}", file=sys.stderr)
+        return 1
+    if model:
+        label = f"{provider}:{model}" if provider else model
+        print(f"Set model override on {args.task_id}: {label} "
+              "(applies on next dispatch)")
+    else:
+        print(f"Cleared model override on {args.task_id} "
+              "(worker uses its profile default)")
+    return 0
+
+
 def _cmd_reclaim(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
         ok = kb.reclaim_task(
@@ -1735,6 +1953,7 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                     task,
                     kb.list_events(conn, args.task),
                     kb.list_runs(conn, args.task),
+                    graph=kb.task_graph_context(conn, args.task),
                     config=diag_config,
                 )
             }
@@ -1760,6 +1979,7 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                     tuple(ids),
                 ):
                     run_by.setdefault(row["task_id"], []).append(row)
+                graph_by = kb.task_graph_contexts(conn, ids)
                 diags_by_task = {}
                 for r in rows:
                     tid = r["id"]
@@ -1767,6 +1987,7 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                         r,
                         ev_by.get(tid, []),
                         run_by.get(tid, []),
+                        graph=graph_by.get(tid),
                         config=diag_config,
                     )
                     if dl:
@@ -1990,6 +2211,39 @@ def _worker_run_id_for(task_id: str) -> Optional[int]:
         return None
 
 
+def _goal_mode_handoff_rejection(task: Optional[kb.Task], evidence: str) -> Optional[str]:
+    """Apply the goal judge to every terminal worker handoff, including review."""
+    if task is None or not task.goal_mode:
+        return None
+    try:
+        from agent.auxiliary_client import get_text_auxiliary_client
+
+        client, model = get_text_auxiliary_client("goal_judge")
+    except Exception:
+        return None
+    if client is None or not model:
+        return None
+
+    from hermes_cli.goals import judge_goal
+
+    verdict = "done"
+    reason = ""
+    try:
+        verdict, reason, _, _, _ = judge_goal(
+            goal=f"{task.title}\n\n{task.body or ''}".strip(),
+            last_response=evidence.strip(),
+        )
+    except Exception as judge_exc:
+        import logging as _logging
+
+        _logging.getLogger(__name__).warning(
+            "goal judge check failed, allowing lifecycle handoff: %s",
+            judge_exc,
+            exc_info=True,
+        )
+    return reason if verdict != "done" else None
+
+
 def _cmd_complete(args: argparse.Namespace) -> int:
     """Mark one or more tasks done. Supports a single id or a list."""
     ids = list(args.task_ids or [])
@@ -2021,49 +2275,22 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
-            # Goal-mode pre-completion judge gate (mirrors the gate in
-            # tools/kanban_tools.py:_handle_complete — Issue #38367).
-            # Without this, a goal_mode worker can call
-            # `hermes kanban complete <id>` from the terminal tool and
-            # bypass the auxiliary judge that the tool-call path enforces.
+            # Goal-mode judge gate (mirrors tools/kanban_tools.py). Apply it
+            # to every terminal handoff so request-review cannot bypass the
+            # acceptance contract that protects complete.
             task = kb.get_task(conn, tid)
-            if task and task.goal_mode:
-                judge_available = False
-                try:
-                    from agent.auxiliary_client import get_text_auxiliary_client
-                    _client, _model = get_text_auxiliary_client("goal_judge")
-                    judge_available = _client is not None and bool(_model)
-                except Exception:
-                    pass
-                if judge_available:
-                    from hermes_cli.goals import judge_goal
-                    verdict = "done"
-                    reason = ""
-                    try:
-                        # judge_goal returns (verdict, reason, parse_failed,
-                        # wait_directive, transport_failed) — see
-                        # hermes_cli/goals.py. Unpacking fewer raises
-                        # ValueError into the fail-open handler below,
-                        # silently disabling the gate.
-                        verdict, reason, _, _, _ = judge_goal(
-                            goal=f"{task.title}\n\n{task.body or ''}".strip(),
-                            last_response=(summary or args.result or "").strip(),
-                        )
-                    except Exception as judge_exc:
-                        import logging as _logging
-                        _logging.getLogger(__name__).warning(
-                            "goal judge check failed, allowing completion: %s",
-                            judge_exc,
-                            exc_info=True,
-                        )
-                    if verdict != "done":
-                        print(
-                            f"kanban: goal completion of {tid} rejected by judge: {reason}. "
-                            f"Provide evidence matching the task's acceptance criteria.",
-                            file=sys.stderr,
-                        )
-                        failed.append(tid)
-                        continue
+            rejection = _goal_mode_handoff_rejection(
+                task,
+                (summary or args.result or "").strip(),
+            )
+            if rejection is not None:
+                print(
+                    f"kanban: goal completion of {tid} rejected by judge: {rejection}. "
+                    f"Provide evidence matching the task's acceptance criteria.",
+                    file=sys.stderr,
+                )
+                failed.append(tid)
+                continue
 
             if not kb.complete_task(
                 conn, tid,
@@ -2185,6 +2412,110 @@ def _cmd_unblock(args: argparse.Namespace) -> int:
                 print(f"cannot unblock {tid} (not blocked/scheduled?)", file=sys.stderr)
             else:
                 print(f"Unblocked {tid}" + (f": {reason}" if reason else ""))
+    return 0 if not failed else 1
+
+
+def _cmd_request_review(args: argparse.Namespace) -> int:
+    tid = args.task_id
+    summary = getattr(args, "summary", None)
+    if summary is not None:
+        summary = summary.strip() or None
+    raw_metadata = getattr(args, "metadata", None)
+    metadata = None
+    if raw_metadata:
+        try:
+            metadata = json.loads(raw_metadata)
+            if not isinstance(metadata, dict):
+                raise ValueError("must be a JSON object")
+        except (ValueError, json.JSONDecodeError) as exc:
+            print(f"kanban: --metadata: {exc}", file=sys.stderr)
+            return 2
+    reviewer = getattr(args, "reviewer", None)
+    with kb.connect_closing() as conn:
+        rejection = _goal_mode_handoff_rejection(
+            kb.get_task(conn, tid),
+            summary or "",
+        )
+        if rejection is not None:
+            print(
+                f"kanban: goal review handoff of {tid} rejected by judge: "
+                f"{rejection}. Provide acceptance evidence matching the task.",
+                file=sys.stderr,
+            )
+            return 1
+        ok, reason = kb.request_review(
+            conn,
+            tid,
+            summary=summary,
+            metadata=metadata,
+            reviewer=reviewer,
+            expected_run_id=_worker_run_id_for(tid),
+            force=bool(getattr(args, "force", False)),
+            with_reason=True,
+        )
+        if not ok:
+            detail = reason or "not running/ready?"
+            print(
+                f"cannot request review for {tid}: {detail}",
+                file=sys.stderr,
+            )
+            return 1
+        persisted_run = kb.latest_run(conn, tid)
+        display_summary = persisted_run.summary if persisted_run else None
+        print(
+            f"Requested review for {tid}"
+            + (f": {display_summary}" if display_summary else "")
+        )
+    return 0
+
+
+def _cmd_request_changes(args: argparse.Namespace) -> int:
+    tid = args.task_id
+    reason = " ".join(args.reason).strip()
+    with kb.connect_closing() as conn:
+        ok, detail = kb.request_changes(
+            conn,
+            tid,
+            reason=reason,
+            expected_run_id=_worker_run_id_for(tid),
+        )
+        if not ok:
+            print(
+                f"cannot request changes for {tid}: {detail or 'invalid review state'}",
+                file=sys.stderr,
+            )
+            return 1
+        print(
+            f"Requested changes for {tid}"
+            + (f"; routed to {detail}" if detail else "")
+        )
+    return 0
+
+
+def _cmd_reopen_review(args: argparse.Namespace) -> int:
+    ids = list(args.task_ids or [])
+    if not ids:
+        print("at least one task_id is required", file=sys.stderr)
+        return 1
+    reason = getattr(args, "reason", None)
+    if reason is not None:
+        reason = str(kb.redact_review_value(reason.strip())).strip() or None
+    author = _profile_author() if reason else None
+    failed: list[str] = []
+    with kb.connect_closing() as conn:
+        for tid in ids:
+            if not kb.reopen_review_task(conn, tid):
+                failed.append(tid)
+                print(f"cannot reopen {tid} (not in review?)", file=sys.stderr)
+            else:
+                if reason:
+                    kb.add_comment(
+                        conn,
+                        tid,
+                        author or "operator",
+                        f"CHANGES REQUESTED: {reason}",
+                    )
+                print(f"Reopened {tid}" + (f": {reason}" if reason else ""))
     return 0 if not failed else 1
 
 
@@ -2312,6 +2643,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             _kanban_cfg.get("max_in_progress_per_profile")
         )
         max_in_progress = _coerce_positive_int(_kanban_cfg.get("max_in_progress"))
+        # Memory-derived default when unset (OOF-30/OOF-77) — same
+        # fallback the gateway-embedded dispatcher applies, so behaviour
+        # matches regardless of which path runs the tick.
+        max_in_progress = kb.resolve_max_in_progress(max_in_progress)
         # CLI --max overrides config kanban.max_spawn when both are present;
         # CLI is the more explicit signal so it wins.
         cli_max = getattr(args, "max", None)
@@ -2610,8 +2945,11 @@ def _cmd_notify_subscribe(args: argparse.Namespace) -> int:
         kb.add_notify_sub(
             conn, task_id=args.task_id,
             platform=args.platform, chat_id=args.chat_id,
+            chat_type=args.chat_type,
             thread_id=args.thread_id, user_id=args.user_id,
+            user_id_alt=getattr(args, "user_id_alt", None),
             notifier_profile=args.notifier_profile or _profile_author(),
+            delivery_mode=getattr(args, "delivery_mode", None),
         )
     print(f"Subscribed {args.platform}:{args.chat_id}"
           + (f":{args.thread_id}" if args.thread_id else "")
@@ -2631,8 +2969,13 @@ def _cmd_notify_list(args: argparse.Namespace) -> int:
     for s in subs:
         thr = f":{s['thread_id']}" if s.get("thread_id") else ""
         owner = f"  owner={s['notifier_profile']}" if s.get("notifier_profile") else ""
+        dmode = s.get("delivery_mode") or "notify"
+        mode = "" if dmode == "notify" else f"  mode={dmode}"
+        ctype = s.get("chat_type") or "dm"
+        ct = "" if ctype == "dm" else f"  chat_type={ctype}"
+        uid_alt = f"  user_id_alt={s['user_id_alt']}" if s.get("user_id_alt") else ""
         print(f"  {s['task_id']:10s}  {s['platform']}:{s['chat_id']}{thr}"
-              f"  (since event {s['last_event_id']}){owner}")
+              f"  (since event {s['last_event_id']}){owner}{ct}{uid_alt}{mode}")
     return 0
 
 
@@ -2878,9 +3221,20 @@ def _cmd_gc(args: argparse.Namespace) -> int:
     removed_ws = 0
     with kb.connect_closing() as conn:
         rows = conn.execute(
-            "SELECT id, workspace_kind, workspace_path FROM tasks WHERE status = 'archived'"
+            "SELECT id, workspace_kind, workspace_path, branch_name FROM tasks "
+            "WHERE status = 'archived'"
         ).fetchall()
     for row in rows:
+        if row["workspace_kind"] == "worktree":
+            # Backstop for worktrees that escaped the completion/archive hook
+            # (e.g. tasks archived before that hook existed). Same safety
+            # predicate: only clean, fully-pushed worktrees are removed.
+            wt_path = row["workspace_path"]
+            if wt_path and Path(wt_path).is_dir():
+                kb._cleanup_worktree_workspace(row["id"], wt_path, row["branch_name"])
+                if not Path(wt_path).is_dir():
+                    removed_ws += 1
+            continue
         if row["workspace_kind"] != "scratch":
             continue
         path = Path(row["workspace_path"] or (scratch_root / row["id"]))
@@ -2996,6 +3350,7 @@ Common subcommands:
   `comment <id> <msg>`  Append a comment
   `attach <id> <path>`  Attach a local file; `attachments <id>` to list
   `complete <id>…`      Mark task(s) done
+  `request-review <id>` Enter first-class review; `request-changes <id> <reason>` returns an active review to its implementer
   `block <id> [reason]` Mark blocked; `schedule <id> [reason]` parks time-delay work; `unblock <id>` to revive
   `assign <id> <profile>`  Reassign
   `boards list`         Show all boards

@@ -232,6 +232,7 @@ const TranscriptPane = memo(function TranscriptPane({
                   })}
                   sections={ui.sections}
                   t={ui.theme}
+                  timestamps={ui.timestamps}
                 />
               )}
 
@@ -417,6 +418,8 @@ const ComposerPane = memo(function ComposerPane({
               <Box flexGrow={0} flexShrink={0} height={inputHeight} width={inputColumns}>
                 {/* Reserve the transcript scrollbar gutter too so typing never rewraps when the scrollbar column repaints. */}
                 <TextInput
+                  accentColor={ui.theme.color.accent}
+                  color={ui.theme.color.text}
                   columns={inputColumns}
                   mouseApiRef={inputMouseRef}
                   onChange={composer.updateInput}
@@ -491,6 +494,7 @@ const StatusRulePane = memo(function StatusRulePane({
         busy={ui.busy}
         cols={composer.cols}
         cwdLabel={status.cwdLabel}
+        focusView={ui.focusView}
         indicatorStyle={ui.indicatorStyle}
         lastTurnEndedAt={status.lastTurnEndedAt}
         liveSessionCount={ui.liveSessionCount}
@@ -500,6 +504,7 @@ const StatusRulePane = memo(function StatusRulePane({
         notice={ui.notice}
         onSessionCountClick={() => patchOverlayState({ sessions: true })}
         sessionStartedAt={status.sessionStartedAt}
+        sessionTitle={status.sessionTitle}
         status={ui.status}
         statusColor={status.statusColor}
         t={ui.theme}
@@ -556,6 +561,7 @@ export const AppLayout = memo(function AppLayout({
                 cols={composer.cols}
                 onApprovalChoice={actions.answerApproval}
                 onClarifyAnswer={actions.answerClarify}
+                onClarifyQuestionAnswer={actions.answerClarifyQuestion}
                 onSecretSubmit={actions.answerSecret}
                 onSudoSubmit={actions.answerSudo}
               />

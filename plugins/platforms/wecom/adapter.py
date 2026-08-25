@@ -70,6 +70,30 @@ from gateway.platforms.base import (
 )
 from utils import env_float
 
+from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
+from agent.secret_scope import get_secret as _scoped_get_secret
+
+
+def _get_scoped_secret(name, default=None):
+    """Scope-aware credential read with the default-profile startup fallback.
+
+    Secondary profiles construct their adapters under a profile secret
+    scope -- the scope is authoritative and a scoped miss returns ``default``
+    (no cross-profile borrow from ``os.environ``, which may hold another
+    profile's value). The DEFAULT profile's adapter constructs and sends
+    *unscoped* under multiplexing, where a bare ``get_secret`` would raise
+    ``UnscopedSecretError`` and crash this path; there ``os.environ`` is that
+    profile's own value, so fall back to it. Same pattern as the Slack
+    ``SLACK_APP_TOKEN`` read (#59739) and
+    ``gateway/platforms/whatsapp_common.py::_get_wsecret``.
+    """
+    try:
+        val = _scoped_get_secret(name, default)
+    except _UnscopedSecretError:
+        val = os.getenv(name)
+    return val if val is not None else default
+
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_WS_URL = "wss://openws.work.weixin.qq.com"
@@ -154,14 +178,14 @@ class WeComAdapter(BasePlatformAdapter):
 
         extra = config.extra or {}
         self._bot_id = str(extra.get("bot_id") or os.getenv("WECOM_BOT_ID", "")).strip()
-        self._secret = str(extra.get("secret") or os.getenv("WECOM_SECRET", "")).strip()
+        self._secret = str(extra.get("secret") or _get_scoped_secret("WECOM_SECRET", "")).strip()
         self._ws_url = str(
             extra.get("websocket_url")
             or extra.get("websocketUrl")
             or os.getenv("WECOM_WEBSOCKET_URL", DEFAULT_WS_URL)
         ).strip() or DEFAULT_WS_URL
 
-        self._dm_policy = str(extra.get("dm_policy") or os.getenv("WECOM_DM_POLICY", "pairing")).strip().lower()
+        self._dm_policy = str(extra.get("dm_policy") or _get_scoped_secret("WECOM_DM_POLICY", "pairing")).strip().lower()
         # dm_policy already honors WECOM_DM_POLICY, so the allowlist must honor
         # WECOM_ALLOWED_USERS too. Without the env fallback an env-only setup
         # (dm_policy=allowlist via env, no config extra) runs with an empty
@@ -169,10 +193,10 @@ class WeComAdapter(BasePlatformAdapter):
         self._allow_from = _coerce_list(
             extra.get("allow_from")
             or extra.get("allowFrom")
-            or os.getenv("WECOM_ALLOWED_USERS", "")
+            or _get_scoped_secret("WECOM_ALLOWED_USERS", "")
         )
 
-        self._group_policy = str(extra.get("group_policy") or os.getenv("WECOM_GROUP_POLICY", "pairing")).strip().lower()
+        self._group_policy = str(extra.get("group_policy") or _get_scoped_secret("WECOM_GROUP_POLICY", "pairing")).strip().lower()
         self._group_allow_from = _coerce_list(extra.get("group_allow_from") or extra.get("groupAllowFrom"))
         self._groups = extra.get("groups") if isinstance(extra.get("groups"), dict) else {}
 
@@ -219,8 +243,14 @@ class WeComAdapter(BasePlatformAdapter):
         try:
             # Tighter keepalive so idle CLOSE_WAIT drains promptly (#18451).
             from gateway.platforms._http_client_limits import platform_httpx_limits
-            self._http_client = httpx.AsyncClient(
-                timeout=30.0, follow_redirects=True, limits=platform_httpx_limits(),
+            from gateway.platforms.base import _ssrf_redirect_guard
+            from tools.url_safety import create_ssrf_safe_async_client
+
+            self._http_client = create_ssrf_safe_async_client(
+                timeout=30.0,
+                follow_redirects=True,
+                event_hooks={"response": [_ssrf_redirect_guard]},
+                limits=platform_httpx_limits(),
             )
             await self._open_connection()
             self._mark_connected()
@@ -578,7 +608,7 @@ class WeComAdapter(BasePlatformAdapter):
             event.source,
             group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
-            profile=event.source.profile,
+            profile=self._session_key_profile(event.source),
         )
 
     def _enqueue_text_event(self, event: MessageEvent) -> None:
@@ -863,9 +893,11 @@ class WeComAdapter(BasePlatformAdapter):
         return True
 
     def _open_dm_opted_in(self) -> bool:
-        if os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}:
+        # Scoped reads (#93522): the default profile's allow-all flag must
+        # not leak into a multiplexed secondary profile's admission gate.
+        if (_get_scoped_secret("GATEWAY_ALLOW_ALL_USERS", "") or "").lower() in {"true", "1", "yes"}:
             return True
-        return os.getenv("WECOM_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"}
+        return (_get_scoped_secret("WECOM_ALLOW_ALL_USERS", "") or "").lower() in {"true", "1", "yes"}
 
     def _is_dm_allowed(self, sender_id: str) -> bool:
         if self._dm_policy == "disabled":
@@ -1095,14 +1127,20 @@ class WeComAdapter(BasePlatformAdapter):
         url: str,
         max_bytes: int,
     ) -> Tuple[bytes, Dict[str, str]]:
-        from tools.url_safety import is_safe_url
+        from gateway.platforms.base import _ssrf_redirect_guard
+        from tools.url_safety import create_ssrf_safe_async_client, is_safe_url
+
         if not is_safe_url(url):
             raise ValueError(f"Blocked unsafe URL (SSRF protection): {url[:80]}")
 
         if not HTTPX_AVAILABLE:
             raise RuntimeError("httpx is required for WeCom media download")
 
-        client = self._http_client or httpx.AsyncClient(timeout=30.0, follow_redirects=True)
+        client = self._http_client or create_ssrf_safe_async_client(
+            timeout=30.0,
+            follow_redirects=True,
+            event_hooks={"response": [_ssrf_redirect_guard]},
+        )
         created_client = client is not self._http_client
         try:
             async with client.stream(
@@ -1719,7 +1757,7 @@ def interactive_setup() -> None:
     Replaces hermes_cli/gateway.py::_setup_wecom and the static
     _PLATFORMS["wecom"] dict. CLI helpers are lazy-imported.
     """
-    from hermes_cli.config import get_env_value, save_env_value
+    from hermes_cli.config import get_env_value, remove_env_value, save_env_value
     from hermes_cli.setup import prompt_choice
     from hermes_cli.cli_output import (
         prompt,
@@ -1817,10 +1855,13 @@ def interactive_setup() -> None:
         else:
             print_info("Skipped — configure later with 'hermes gateway setup'")
 
-    home = prompt("Home chat ID (optional, for cron/notifications)", password=False)
+    home = prompt("Home chat ID (optional, for cron/notifications)", password=False).strip()
     if home:
         save_env_value("WECOM_HOME_CHANNEL", home)
         print_success(f"Home channel set to {home}")
+    else:
+        if remove_env_value("WECOM_HOME_CHANNEL"):
+            print_info("Home channel cleared.")
 
     print_success("💬 WeCom configured!")
 
@@ -1861,7 +1902,7 @@ def register(ctx) -> None:
         is_connected=_is_connected,
         validate_config=_is_connected,
         required_env=["WECOM_BOT_ID", "WECOM_SECRET"],
-        install_hint="pip install 'hermes-agent[wecom]'",
+        install_hint="Run `hermes setup` to install WeCom support.",
         setup_fn=interactive_setup,
         allowed_users_env="WECOM_ALLOWED_USERS",
         allow_all_env="WECOM_ALLOW_ALL_USERS",
@@ -1872,16 +1913,20 @@ def register(ctx) -> None:
         allow_update_command=True,
     )
 
-    from plugins.platforms.wecom.callback_adapter import check_wecom_callback_requirements
+    from plugins.platforms.wecom.callback_adapter import (
+        check_wecom_callback_requirements,
+        ensure_wecom_callback_requirements,
+    )
     ctx.register_platform(
         name="wecom_callback",
         label="WeCom Callback (self-built apps)",
         adapter_factory=_build_callback_adapter,
         check_fn=check_wecom_callback_requirements,
+        ensure_deps_fn=ensure_wecom_callback_requirements,
         is_connected=_callback_is_connected,
         validate_config=_callback_is_connected,
         required_env=["WECOM_CALLBACK_CORP_ID", "WECOM_CALLBACK_CORP_SECRET"],
-        install_hint="pip install 'hermes-agent[wecom]'",
+        install_hint="Run `hermes setup` to install WeCom support.",
         allowed_users_env="WECOM_CALLBACK_ALLOWED_USERS",
         allow_all_env="WECOM_CALLBACK_ALLOW_ALL_USERS",
         emoji="💼",

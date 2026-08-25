@@ -19,7 +19,7 @@ export interface RevalidateRemoteConnectionOptions<TConnection extends RemoteCon
   connectionPromise: Promise<TConnection>
   currentConnectionPromise: () => null | Promise<TConnection>
   log: (message: string) => void
-  probe: (url: string, options: { timeoutMs: number }) => Promise<unknown>
+  probe: (connection: TConnection, path: string, options: { timeoutMs: number }) => Promise<unknown>
   resetConnection: () => void
   tracker: RemoteLivenessTracker
 }
@@ -117,6 +117,74 @@ export class RemoteLivenessTracker {
   }
 }
 
+export interface PooledRemoteEntry<TConnection extends RemoteConnectionDescriptor = RemoteConnectionDescriptor> {
+  connectionPromise?: null | Promise<TConnection>
+  process?: unknown
+  remoteBaseUrl?: null | string
+}
+
+export interface RevalidatePooledRemoteBackendsOptions<TConnection extends RemoteConnectionDescriptor> {
+  entries: Iterable<[string, PooledRemoteEntry<TConnection>]>
+  log: (message: string) => void
+  probe: (connection: TConnection, path: string, options: { timeoutMs: number }) => Promise<unknown>
+  stopBackend: (profile: string) => void
+  tracker: RemoteLivenessTracker
+}
+
+/**
+ * Probe pooled REMOTE descriptors and drop the dead ones.
+ *
+ * A pooled entry backed by a remote host has no child process, so the 'exit'
+ * handler that clears a dead local backend never fires, and the renderer's
+ * keepalive touch keeps the idle reaper off it. Without this the pool serves a
+ * descriptor for an unreachable host indefinitely.
+ *
+ * Entries share the primary's failure policy, keyed per base URL, so a profile
+ * pointing at the same host as another does not burn the streak twice as fast.
+ */
+export async function revalidatePooledRemoteBackends<TConnection extends RemoteConnectionDescriptor>({
+  entries,
+  log,
+  probe,
+  stopBackend,
+  tracker
+}: RevalidatePooledRemoteBackendsOptions<TConnection>): Promise<{ dropped: string[] }> {
+  const remotes = [...entries].filter(([, entry]) => !entry.process && entry.remoteBaseUrl)
+  const dropped: string[] = []
+
+  await Promise.all(
+    remotes.map(async ([profile, entry]) => {
+      const baseUrl = String(entry.remoteBaseUrl).replace(/\/+$/, '')
+
+      try {
+        if (!entry.connectionPromise) {
+          throw new Error('Remote backend descriptor is unavailable.')
+        }
+
+        const connection = await entry.connectionPromise
+        await probe(connection, '/api/status', { timeoutMs: REMOTE_LIVENESS_TIMEOUT_MS })
+        tracker.recordSuccess(baseUrl)
+      } catch {
+        const failure = tracker.recordFailure(baseUrl)
+
+        if (!failure.shouldReset) {
+          log(
+            `Pooled remote backend for profile "${profile}" failed liveness probe (${failure.failures}/${REMOTE_LIVENESS_FAILURE_LIMIT}); keeping descriptor for retry.`
+          )
+
+          return
+        }
+
+        log(`Pooled remote backend for profile "${profile}" failed liveness probe; dropping stale descriptor.`)
+        stopBackend(profile)
+        dropped.push(profile)
+      }
+    })
+  )
+
+  return { dropped }
+}
+
 /**
  * Probe the cached primary remote connection and apply the failure policy.
  * The caller owns single-flight coordination; identity checks here ensure an
@@ -150,7 +218,7 @@ export async function revalidateRemoteConnection<TConnection extends RemoteConne
   const baseUrl = connection.baseUrl.replace(/\/+$/, '')
 
   try {
-    await probe(`${baseUrl}/api/status`, { timeoutMs: REMOTE_LIVENESS_TIMEOUT_MS })
+    await probe(connection, '/api/status', { timeoutMs: REMOTE_LIVENESS_TIMEOUT_MS })
 
     if (currentConnectionPromise() !== connectionPromise) {
       return { ok: true, rebuilt: false }

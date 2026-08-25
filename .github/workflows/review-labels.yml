@@ -23,6 +23,10 @@ on:
         description: Whether CI-sensitive files (eslint config, workflows, actions) changed.
         type: boolean
         default: false
+      ci_review_files:
+        description: JSON list of CI-sensitive files changed by the pull request.
+        type: string
+        default: '[]'
       mcp_catalog:
         description: Whether the MCP catalog / installer changed.
         type: boolean
@@ -78,18 +82,39 @@ jobs:
         id: build-status
         env:
           CI_REVIEW: ${{ inputs.ci_review }}
+          CI_REVIEW_FILES: ${{ inputs.ci_review_files }}
           MCP_CATALOG: ${{ inputs.mcp_catalog }}
           SUPPLY_CHAIN: ${{ inputs.supply_chain }}
           LABEL_PRESENT: ${{ steps.label-check.outputs.ci_reviewed }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
           args=()
           if [ "$CI_REVIEW" = "true" ]; then args+=(--ci-review); fi
+          args+=(--ci-review-files "$CI_REVIEW_FILES")
           if [ "$MCP_CATALOG" = "true" ]; then args+=(--mcp-catalog); fi
           if [ "$SUPPLY_CHAIN" = "true" ]; then args+=(--supply-chain); fi
           if [ "$LABEL_PRESENT" = "true" ]; then args+=(--label-present); fi
 
-          python3 scripts/ci/emit_review_status.py "${args[@]}" --output "$GITHUB_OUTPUT"
+          # Write to both $GITHUB_OUTPUT and review-status.json for the
+          # live comment poller to pick up as an artifact.
+          python3 scripts/ci/emit_review_status.py "${args[@]}" \
+            --repo-url "$REPO_URL" --base-sha "$BASE_SHA" --head-sha "$HEAD_SHA" \
+            --output "$GITHUB_OUTPUT"
+          grep '^review_status=' "$GITHUB_OUTPUT" > review-status.json
+
+      - name: Upload review status artifact
+        if: always() && steps.build-status.outcome != 'skipped'
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: review-status-review-labels
+          path: review-status.json
+          retention-days: 1
+          overwrite: true
+          if-no-files-found: ignore
 
       - name: Fail on missing label
         if: steps.label-check.outputs.ci_reviewed != 'true'
